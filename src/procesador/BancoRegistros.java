@@ -23,4 +23,15 @@ public class BancoRegistros {
             registros[numeroRegistro] = dato;
         }
     }
+    
+    public void imprimirEstado() {
+        System.out.print("   [ESTADO REGISTROS] ");
+        for (int i = 0; i < 32; i++) {
+            if (registros[i] != 0) {
+                System.out.print("$" + i + " = " + registros[i] + " | ");
+            }
+        }
+        System.out.println();
+    }
+    
 }

@@ -10,11 +10,28 @@ public class UnidadControl {
     private ContadorPrograma pc;
     private MemoriaRAM ram;
 
-    // Constantes para simular opcodes básicos de MIPS
-    private final int OPCODE_R_TYPE = 0; // Instrucciones de registro a registro (add, sub, mul, slt)
-    private final int OPCODE_ADDI = 8;   // Suma inmediata
-    private final int OPCODE_BEQ = 4;    // Branch on equal (Control de flujo)
-    private final int OPCODE_J = 2;      // Jump incondicional (Control de flujo)
+    // --- MÁQUINA DE ESTADOS MULTICICLO ---
+    public enum Fase { FETCH, DECODE, EXECUTE, MEMORY, WRITE_BACK }
+    private Fase faseActual = Fase.FETCH;
+
+    // --- REGISTROS INTERMEDIOS (LATCHES) ---
+    private int IR = 0;       // Registro de Instrucción
+    private int A = 0;        // Registro temporal para dato rs
+    private int B = 0;        // Registro temporal para dato rt
+    private int ALUOut = 0;   // Salida temporal de la ALU
+    private int MDR = 0;      // Registro de Dato de Memoria
+
+    // --- OPCODES MIPS ---
+    private final int OPCODE_R_TYPE = 0x00; 
+    private final int OPCODE_J      = 0x02; 
+    private final int OPCODE_BEQ    = 0x04; 
+    private final int OPCODE_BNE    = 0x05; 
+    private final int OPCODE_ADDI   = 0x08; 
+    private final int OPCODE_LW     = 0x23; 
+    private final int OPCODE_SW     = 0x2B; 
+
+    private final int FUNCT_ADD = 0x20, FUNCT_SUB = 0x22, FUNCT_AND = 0x24;
+    private final int FUNCT_OR  = 0x25, FUNCT_SLT = 0x2A, FUNCT_MUL = 0x18; 
 
     public UnidadControl(ALU alu, BancoRegistros registros, ContadorPrograma pc, MemoriaRAM ram) {
         this.alu = alu;
@@ -23,82 +40,120 @@ public class UnidadControl {
         this.ram = ram;
     }
 
-    /**
-     * Extrae la instrucción, la decodifica y ejecuta el ciclo.
-     */
-    public void ejecutarCiclo() {
-        // 1. FETCH (Búsqueda): Obtener la instrucción de la RAM usando el PC
-        int instruccion = ram.leer(pc.getDireccion());
-        pc.incrementar(); // El PC siempre avanza al iniciar el ciclo
+    public Fase getFaseActual() {
+        return faseActual;
+    }
 
-        // 2. DECODE (Decodificación): Extraer el opcode (los 6 bits más significativos en MIPS real, 
-        // pero para el simulador podemos simplificar la abstracción).
-        // En una implementación de bits, sería algo como: int opcode = (instruccion >>> 26) & 0x3F;
-        // Para simplificar la emulación educativa, asumamos que tu instrucción guarda el opcode.
-        int opcode = decodificarOpcode(instruccion);
+    // Avanza una sola fase del reloj por cada llamada
+    public String ejecutarCicloReloj() {
+        String logAccion = "";
 
-        // 3. EXECUTE (Ejecución):
-        switch (opcode) {
-            case OPCODE_R_TYPE:
-                ejecutarTipoR(instruccion);
+        switch (faseActual) {
+            case FETCH:
+                IR = ram.leer(pc.getDireccion());
+                if (IR == 0) throw new RuntimeException("HALT: Fin del programa. Memoria vacía.");
+                logAccion = "[FETCH] Extrayendo instrucción de RAM. PC avanza a " + (pc.getDireccion() + 1);
+                pc.incrementar();
+                faseActual = Fase.DECODE;
                 break;
-            case OPCODE_ADDI:
-                ejecutarAddi(instruccion);
+
+            case DECODE:
+                int rs = (IR >>> 21) & 0x1F;
+                int rt = (IR >>> 16) & 0x1F;
+                A = registros.leerRegistro(rs);
+                B = registros.leerRegistro(rt);
+                logAccion = "[DECODE] Decodificando. Valores leídos -> rs: " + A + ", rt: " + B;
+                faseActual = Fase.EXECUTE;
                 break;
-            case OPCODE_BEQ:
-                ejecutarBeq(instruccion);
+
+            case EXECUTE:
+                int opcode = (IR >>> 26) & 0x3F;
+                if (opcode == OPCODE_R_TYPE) {
+                    int funct = IR & 0x3F;
+                    ejecutarALUTipoR(funct);
+                    logAccion = "[EXECUTE] Operación Tipo R calculada en ALU = " + ALUOut;
+                    faseActual = Fase.WRITE_BACK; // R-Type salta a Write-Back
+                } 
+                else if (opcode == OPCODE_ADDI) {
+                    short inmediato = (short) (IR & 0xFFFF);
+                    ALUOut = alu.ejecutarOperacion(A, inmediato, OperacionMIPS.SUMA);
+                    logAccion = "[EXECUTE] Suma Inmediata (ADDI) calculada = " + ALUOut;
+                    faseActual = Fase.WRITE_BACK;
+                } 
+                else if (opcode == OPCODE_LW || opcode == OPCODE_SW) {
+                    short offset = (short) (IR & 0xFFFF);
+                    ALUOut = A + offset; // Calcular dirección de memoria
+                    logAccion = "[EXECUTE] Dirección de RAM calculada = " + ALUOut;
+                    faseActual = Fase.MEMORY; // LW y SW necesitan acceder a memoria
+                } 
+                else if (opcode == OPCODE_BEQ) {
+                    short offset = (short) (IR & 0xFFFF);
+                    alu.ejecutarOperacion(A, B, OperacionMIPS.RESTA);
+                    if (alu.getBanderaZero()) pc.setDireccion(pc.getDireccion() + offset - 1);
+                    logAccion = "[EXECUTE] BEQ evaluado. Bandera Zero: " + alu.getBanderaZero();
+                    faseActual = Fase.FETCH; // Branch termina aquí
+                }
+                else if (opcode == OPCODE_BNE) {
+                    short offset = (short) (IR & 0xFFFF);
+                    alu.ejecutarOperacion(A, B, OperacionMIPS.RESTA);
+                    if (!alu.getBanderaZero()) pc.setDireccion(pc.getDireccion() + offset - 1);
+                    logAccion = "[EXECUTE] BNE evaluado. Bandera Zero: " + alu.getBanderaZero();
+                    faseActual = Fase.FETCH; // Branch termina aquí
+                }
+                else if (opcode == OPCODE_J) {
+                    int jumpAddr = IR & 0x3FFFFFF;
+                    pc.setDireccion(jumpAddr);
+                    logAccion = "[EXECUTE] Salto Incondicional (J) a PC = " + jumpAddr;
+                    faseActual = Fase.FETCH; // Jump termina aquí
+                }
                 break;
-            case OPCODE_J:
-                ejecutarJump(instruccion);
+
+            case MEMORY:
+                int opMem = (IR >>> 26) & 0x3F;
+                if (opMem == OPCODE_LW) {
+                    MDR = ram.leer(ALUOut);
+                    logAccion = "[MEMORY] Dato leído de RAM[" + ALUOut + "] = " + MDR;
+                    faseActual = Fase.WRITE_BACK;
+                } 
+                else if (opMem == OPCODE_SW) {
+                    ram.escribir(ALUOut, B);
+                    logAccion = "[MEMORY] Dato " + B + " escrito en RAM[" + ALUOut + "]";
+                    faseActual = Fase.FETCH; // Store Word termina aquí
+                }
                 break;
-            default:
-                throw new UnsupportedOperationException("Instrucción no soportada por el simulador.");
+
+            case WRITE_BACK:
+                int opWb = (IR >>> 26) & 0x3F;
+                if (opWb == OPCODE_R_TYPE) {
+                    int rd = (IR >>> 11) & 0x1F;
+                    registros.escribirRegistro(rd, ALUOut);
+                    logAccion = "[WRITE_BACK] Resultado " + ALUOut + " guardado en $" + rd;
+                } 
+                else if (opWb == OPCODE_ADDI) {
+                    int rtAddi = (IR >>> 16) & 0x1F;
+                    registros.escribirRegistro(rtAddi, ALUOut);
+                    logAccion = "[WRITE_BACK] Resultado " + ALUOut + " guardado en $" + rtAddi;
+                } 
+                else if (opWb == OPCODE_LW) {
+                    int rtLw = (IR >>> 16) & 0x1F;
+                    registros.escribirRegistro(rtLw, MDR);
+                    logAccion = "[WRITE_BACK] Dato " + MDR + " (desde RAM) guardado en $" + rtLw;
+                }
+                logAccion += " \n----------------------------------";
+                faseActual = Fase.FETCH; // Reiniciar el ciclo para la siguiente instrucción
+                break;
         }
-    }
-    
-    
-
- // Método real para ejecutar instrucciones Tipo R (como la suma)
-    private void ejecutarTipoR(int instruccion) {
-        // 1. Extraer los segmentos de la instrucción usando máscaras de bits MIPS
-        int rs = (instruccion >>> 21) & 0x1F;    // 5 bits para Registro Origen 1
-        int rt = (instruccion >>> 16) & 0x1F;    // 5 bits para Registro Origen 2
-        int rd = (instruccion >>> 11) & 0x1F;    // 5 bits para Registro Destino
-        int funct = instruccion & 0x3F;          // Últimos 6 bits que indican la operación matemática
-        
-        // 2. Leer los valores físicos del Banco de Registros
-        int valorRs = registros.leerRegistro(rs);
-        int valorRt = registros.leerRegistro(rt);
-        int resultado = 0;
-
-        // 3. Ejecutar en la ALU dependiendo del código 'funct'
-        // El 'funct' binario 100000 equivale a 32 en decimal (Suma en MIPS)
-        if (funct == 32) { 
-            resultado = alu.ejecutarOperacion(valorRs, valorRt, OperacionMIPS.SUMA);
-        } 
-        // Si quisieras agregar la multiplicación (funct 24) o resta (funct 34), agregarías más "else if" aquí.
-
-        // 4. Escribir el resultado de la ALU de vuelta en el registro destino
-        registros.escribirRegistro(rd, resultado);
+        return logAccion;
     }
 
-    private void ejecutarAddi(int instruccion) {
-        // Extrae rs, rt y el valor inmediato.
-        // valorRt = rs + inmediato
-    }
-
-    private void ejecutarBeq(int instruccion) {
-        // Extrae rs, rt y el offset (salto).
-        // Resta rs y rt en la ALU. Si alu.getBanderaZero() es true, modifica el PC (Control de flujo).
-    }
-
-    private void ejecutarJump(int instruccion) {
-        // Extrae la dirección destino y fuerza al PC a ir allí (pc.setDireccion(...))
-    }
-
- // Método real para decodificar (extrae los 6 bits más significativos)
-    private int decodificarOpcode(int instruccion) {
-        // Desplaza 26 bits a la derecha y aplica una máscara para asegurar que sean solo 6 bits
-        return (instruccion >>> 26) & 0x3F; 
+    private void ejecutarALUTipoR(int funct) {
+        switch (funct) {
+            case FUNCT_ADD: ALUOut = alu.ejecutarOperacion(A, B, OperacionMIPS.SUMA); break;
+            case FUNCT_SUB: ALUOut = alu.ejecutarOperacion(A, B, OperacionMIPS.RESTA); break;
+            case FUNCT_MUL: ALUOut = alu.ejecutarOperacion(A, B, OperacionMIPS.MULTIPLICACION); break;
+            case FUNCT_AND: ALUOut = alu.ejecutarOperacion(A, B, OperacionMIPS.AND); break;
+            case FUNCT_OR:  ALUOut = alu.ejecutarOperacion(A, B, OperacionMIPS.OR); break;
+            case FUNCT_SLT: ALUOut = alu.ejecutarOperacion(A, B, OperacionMIPS.SET_LESS_THAN); break;
+        }
     }
 }
